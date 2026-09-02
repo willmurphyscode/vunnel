@@ -266,6 +266,15 @@ def map_parsed(  # noqa: C901, PLR0912, PLR0915
             vulns[namespace_name] = r
 
         # Explicit "not affected" → emit a FixedIn with version "0".
+        #
+        # These records are load-bearing, NOT filler. A `Version: "0"` entry can never
+        # produce a positive match on its own (every installed version satisfies it),
+        # which makes it tempting to filter out as dead weight. Don't. Downstream
+        # consumers read it as positive evidence that this source package is not
+        # vulnerable to this CVE, and use it to suppress a false positive arriving from
+        # another matcher — e.g. a CPE match against the same deb. Dropping them
+        # silently re-opens those false positives, and they are part of vunnel's
+        # output contract.
         if p.status == "not-affected":
             pkg = FixedIn()
             pkg.Name = p.package

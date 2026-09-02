@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 import shutil
+import sqlite3
 import tarfile
+import tempfile
 from unittest.mock import patch
 
 import orjson
@@ -11,6 +14,7 @@ import pytest
 
 from vunnel import provider, result, schema, workspace
 from vunnel.providers.ubuntu import Config, Provider
+from vunnel.providers.ubuntu import parser as ubuntu_parser
 from vunnel.providers.ubuntu.parser import (
     Parser,
     _annotate_wont_fix,
@@ -236,6 +240,61 @@ def _fragment_paths(workspace):
     if not os.path.isdir(fragments_dir):
         return []
     return sorted(os.listdir(fragments_dir))
+
+
+def _seed_fragment(workspace, slug, live=0, withdrawn=0, modified="2026-08-01T00:00:00Z"):
+    """Write input/fragments/<slug>.db with `live` non-withdrawn and `withdrawn` withdrawn envelopes.
+
+    Same idiom TestParserFreeze uses to plant a frozen fragment. Withdrawn envelopes
+    carry a top-level `withdrawn` key (which is what the live-record count keys off);
+    live ones must not have one anywhere in the blob.
+
+    live=withdrawn=0 still leaves a structurally valid but empty fragment behind, so
+    "ecosystem still published, zero records" is expressible.
+    """
+    fragments_dir = os.path.join(workspace.input_path, "fragments")
+    os.makedirs(fragments_dir, exist_ok=True)
+    path = os.path.join(fragments_dir, f"{slug}.db")
+
+    if live == 0 and withdrawn == 0:
+        # result.Writer never creates the file when nothing is written to it
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE results (id TEXT PRIMARY KEY, record BLOB)")
+        conn.commit()
+        conn.close()
+        return path
+
+    osv_schema = schema.OSVSchema(version="1.7.0")
+    with result.Writer(
+        workspace=workspace,
+        result_state_policy=result.ResultStatePolicy.DELETE_BEFORE_WRITE,
+        store_strategy=result.StoreStrategy.SQLITE,
+        write_location=path,
+    ) as w:
+        for i in range(live):
+            w.write(
+                identifier=f"{slug}/ubuntu-cve-live-{i}",
+                schema=osv_schema,
+                payload={
+                    "id": f"UBUNTU-CVE-LIVE-{i}",
+                    "modified": modified,
+                    "details": "live record",
+                    "affected": [],
+                },
+            )
+        for i in range(withdrawn):
+            w.write(
+                identifier=f"{slug}/ubuntu-cve-gone-{i}",
+                schema=osv_schema,
+                payload={
+                    "id": f"UBUNTU-CVE-GONE-{i}",
+                    "modified": modified,
+                    "withdrawn": modified,
+                    "details": "withdrawn record",
+                    "affected": [],
+                },
+            )
+    return path
 
 
 class TestParserFragmentWriter:
@@ -696,12 +755,18 @@ class TestParserLegacyPassthrough:
         for _id, sch, _payload in records:
             assert "/os/" in sch.url
 
-    def test_skips_records_for_osv_covered_namespaces(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+    def test_skips_records_for_osv_covered_namespaces(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # SCOPE NOTE: the release-level filter now lives ONLY on this default-argument
+        # path. It still feeds the non-downconvert lane, but the downconvert lane calls
+        # `_iter_normalized_cve_data(apply_osv_coverage_filter=False)` and merges legacy
+        # into OSV per source package instead of suppressing whole releases — see
+        # TestMergedLaneCoverageGating::test_downconvert_lane_emits_legacy_for_an_osv_covered_release.
         _seed_normalized(fresh_workspace, fixture_dir)
-        # plant a fragment for 18.04 — CVE-2022-31258 bionic should be filtered
-        fragments_dir = os.path.join(fresh_workspace.input_path, "fragments")
-        os.makedirs(fragments_dir)
-        open(os.path.join(fragments_dir, "ubuntu-18.04-lts.db"), "wb").close()
+        # plant a HEALTHY fragment for 18.04 — CVE-2022-31258 bionic should be filtered.
+        # (Coverage is a live-record count, so the fragment has to actually hold records;
+        # an empty file on disk is a dead-ecosystem residue and covers nothing.)
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2)
 
         p = Parser(workspace=fresh_workspace)
         identifiers = sorted(r[0] for r in p._iter_normalized_cve_data())
@@ -713,6 +778,27 @@ class TestParserLegacyPassthrough:
             "ubuntu:12.10/cve-2012-5124",
             "ubuntu:12.10/cve-2013-6627",
             "ubuntu:13.04/cve-2013-6627",
+        ]
+
+    def test_coverage_filter_off_emits_every_namespace(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # `apply_osv_coverage_filter=False` is what the merged lane passes: no release
+        # is suppressed, so the OSV-covered 18.04 record comes through and can be
+        # merged package-by-package downstream.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2)
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covers_legacy_namespace("ubuntu:18.04") is True
+
+        identifiers = sorted(r[0] for r in p._iter_normalized_cve_data(apply_osv_coverage_filter=False))
+        assert identifiers == [
+            "ubuntu:12.04/cve-2012-5124",
+            "ubuntu:12.04/cve-2013-6627",
+            "ubuntu:12.10/cve-2012-5124",
+            "ubuntu:12.10/cve-2013-6627",
+            "ubuntu:13.04/cve-2013-6627",
+            "ubuntu:18.04/cve-2022-31258",
         ]
 
     def test_missing_dir_yields_nothing(self, fresh_workspace, auto_fake_fixdate_finder):
@@ -754,10 +840,15 @@ class TestParserLegacyPassthrough:
         fixed_in_versions = [f["Version"] for f in vuln["FixedIn"]]
         assert "3.0.1271.97-0ubuntu0.12.04.1" in fixed_in_versions
 
-    def test_fixdater_not_queried_for_osv_covered_namespaces(self, fresh_workspace, fixture_dir, fake_fixdate_finder):
-        # Count fixdater queries via a callable response. With a fragment for 18.04
-        # present, the bionic legacy record (CVE-2022-31258) should never reach map_parsed
-        # — so fixdater should be called zero times for it.
+    def test_fixdater_not_queried_for_osv_covered_namespaces(self, fresh_workspace, fixture_dir, fake_fixdate_finder, monkeypatch):
+        # Count fixdater queries via a callable response. With a healthy fragment for
+        # 18.04 present, the bionic legacy record (CVE-2022-31258) should never reach
+        # map_parsed — so fixdater should be called zero times for it.
+        #
+        # SCOPE NOTE: this is the still-gated default path (the non-downconvert lane).
+        # The merged lane runs with the filter off and therefore DOES query fixdater
+        # for OSV-covered releases — that's the cost of merging instead of suppressing.
+        # See test_fixdater_queried_for_covered_namespaces_when_filter_off below.
         calls = []
 
         def counting_responses(vuln_id, cpe_or_package, fix_version, ecosystem):
@@ -766,10 +857,9 @@ class TestParserLegacyPassthrough:
 
         fake_fixdate_finder(responses=counting_responses)
         _seed_normalized(fresh_workspace, fixture_dir)
-        # plant a fragment for 18.04
-        fragments_dir = os.path.join(fresh_workspace.input_path, "fragments")
-        os.makedirs(fragments_dir)
-        open(os.path.join(fragments_dir, "ubuntu-18.04-lts.db"), "wb").close()
+        # plant a healthy (OSV-covered) fragment for 18.04
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2)
 
         p = Parser(workspace=fresh_workspace)
         list(p._iter_normalized_cve_data())
@@ -781,9 +871,912 @@ class TestParserLegacyPassthrough:
         assert any(c[0] == "CVE-2012-5124" for c in calls)
         assert any(c[0] == "CVE-2013-6627" for c in calls)
 
+    def test_covered_namespaces_reach_map_parsed_when_filter_off(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # The other half of the pair above, asserted one level up from fixdater:
+        # `map_parsed` (which is what queries fixdater, per released patch) is the
+        # work the filter exists to avoid. With the filter ON the bionic file never
+        # reaches it; with the filter OFF — the merged lane's setting — it does.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2)
+
+        mapped = []
+        real_map_parsed = ubuntu_parser.parser_legacy.map_parsed
+
+        def spy(cve_file, *args, **kwargs):
+            mapped.append(cve_file.name)
+            return real_map_parsed(cve_file, *args, **kwargs)
+
+        monkeypatch.setattr(ubuntu_parser.parser_legacy, "map_parsed", spy)
+
+        p = Parser(workspace=fresh_workspace)
+        list(p._iter_normalized_cve_data())
+        assert "CVE-2022-31258" not in mapped, mapped
+
+        mapped.clear()
+        list(p._iter_normalized_cve_data(apply_osv_coverage_filter=False))
+        assert "CVE-2022-31258" in mapped, mapped
+
+
+# ---------------------------------------------------------------------------
+# OSV coverage detection — a release is covered by live record COUNT, not by
+# the existence of a fragment file
+#
+# When Canonical stops publishing a release they leave the ecosystem in place
+# with a residue of already-`withdrawn` records rather than dropping it. So
+# `ubuntu-25.04.db` existing proves nothing: measured live (non-withdrawn)
+# counts in 2026-09 are 0 to 4 for dead fragments (25.04: 3, 24.10: 4, 26.04: 0)
+# versus 986 for the smallest healthy one. Treating "file exists" as coverage
+# suppressed ~25,000 plucky CVEs in normalized-cve-data behind 3 usable rows.
+# ---------------------------------------------------------------------------
+
+
+class TestFragmentLiveRecordCount:
+    def test_counts_only_non_withdrawn_records(self, fresh_workspace, auto_fake_fixdate_finder):
+        # the plucky shape in miniature: mostly withdrawn residue, a few live rows
+        path = _seed_fragment(fresh_workspace, "ubuntu-25.04", live=3, withdrawn=7)
+        p = Parser(workspace=fresh_workspace)
+        assert p._fragment_live_record_count(path) == 3
+
+    def test_all_live_counts_every_row(self, fresh_workspace, auto_fake_fixdate_finder):
+        path = _seed_fragment(fresh_workspace, "ubuntu-22.04-lts", live=5)
+        p = Parser(workspace=fresh_workspace)
+        assert p._fragment_live_record_count(path) == 5
+
+    def test_valid_but_empty_fragment_counts_zero(self, fresh_workspace, auto_fake_fixdate_finder):
+        # real shape of a fully-dead ecosystem (26.04 measured 0 live records)
+        path = _seed_fragment(fresh_workspace, "ubuntu-26.04", live=0, withdrawn=0)
+        p = Parser(workspace=fresh_workspace)
+        assert p._fragment_live_record_count(path) == 0
+
+    def test_nonexistent_path_returns_zero_and_creates_nothing(self, fresh_workspace, auto_fake_fixdate_finder):
+        # the counter is read-only: a missing fragment must not be conjured into existence
+        p = Parser(workspace=fresh_workspace)
+        missing = os.path.join(fresh_workspace.input_path, "fragments", "ubuntu-99.04.db")
+        assert p._fragment_live_record_count(missing) == 0
+        assert not os.path.exists(missing)
+
+    def test_zero_byte_file_returns_zero(self, fresh_workspace, auto_fake_fixdate_finder):
+        # sqlite happily opens a zero-byte file as an empty database — no `results` table
+        fragments_dir = os.path.join(fresh_workspace.input_path, "fragments")
+        os.makedirs(fragments_dir)
+        path = os.path.join(fragments_dir, "ubuntu-18.04-lts.db")
+        open(path, "wb").close()
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._fragment_live_record_count(path) == 0
+
+    def test_non_sqlite_file_returns_zero(self, fresh_workspace, auto_fake_fixdate_finder):
+        fragments_dir = os.path.join(fresh_workspace.input_path, "fragments")
+        os.makedirs(fragments_dir)
+        path = os.path.join(fragments_dir, "ubuntu-18.04-lts.db")
+        with open(path, "wb") as f:
+            f.write(b"this is not a database, it is a pipe")
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._fragment_live_record_count(path) == 0
+
+    def test_sqlite_without_results_table_returns_zero(self, fresh_workspace, auto_fake_fixdate_finder):
+        fragments_dir = os.path.join(fresh_workspace.input_path, "fragments")
+        os.makedirs(fragments_dir)
+        path = os.path.join(fragments_dir, "ubuntu-18.04-lts.db")
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE something_else (id TEXT)")
+        conn.commit()
+        conn.close()
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._fragment_live_record_count(path) == 0
+
+
+class TestOSVCoveredVersions:
+    def test_missing_fragments_dir_covers_nothing(self, fresh_workspace, auto_fake_fixdate_finder):
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == set()
+        assert p._osv_covers_legacy_namespace("ubuntu:18.04") is False
+
+    def test_empty_fragments_dir_covers_nothing(self, fresh_workspace, auto_fake_fixdate_finder):
+        os.makedirs(os.path.join(fresh_workspace.input_path, "fragments"))
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == set()
+
+    def test_zero_byte_fragment_is_not_covered(self, fresh_workspace, auto_fake_fixdate_finder):
+        # exactly what the old file-existence predicate got wrong
+        fragments_dir = os.path.join(fresh_workspace.input_path, "fragments")
+        os.makedirs(fragments_dir)
+        open(os.path.join(fragments_dir, "ubuntu-18.04-lts.db"), "wb").close()
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == set()
+        assert p._osv_covers_legacy_namespace("ubuntu:18.04") is False
+
+    def test_withdrawn_residue_fragment_is_not_covered(self, fresh_workspace, auto_fake_fixdate_finder):
+        # measured plucky shape: 184 rows, 181 of them withdrawn. Uses the REAL
+        # threshold constant — no monkeypatching — because this is the live bug.
+        _seed_fragment(fresh_workspace, "ubuntu-25.04", live=3, withdrawn=181)
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == set()
+        assert p._osv_covers_legacy_namespace("ubuntu:25.04") is False
+
+    def test_healthy_fragment_is_covered(self, fresh_workspace, auto_fake_fixdate_finder, monkeypatch):
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-22.04-lts", live=4, withdrawn=3)
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == {"22.04"}
+        assert p._osv_covers_legacy_namespace("ubuntu:22.04") is True
+
+    def test_threshold_boundary_against_the_real_constant(self, fresh_workspace, auto_fake_fixdate_finder):
+        # Deliberately NOT monkeypatched: pins the real default so that changing
+        # _MIN_LIVE_RECORDS_FOR_COVERAGE can't slip through silently, and pins the
+        # comparison as >= rather than >.
+        threshold = ubuntu_parser._MIN_LIVE_RECORDS_FOR_COVERAGE
+        _seed_fragment(fresh_workspace, "ubuntu-20.04-lts", live=threshold - 1)
+        _seed_fragment(fresh_workspace, "ubuntu-22.04-lts", live=threshold)
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == {"22.04"}
+
+    def test_healthy_but_stale_fragment_is_covered_with_no_tarball(self, fresh_workspace, auto_fake_fixdate_finder, monkeypatch):
+        # Bucket-2 / freeze invariant: a release that has aged out of the feed keeps a
+        # healthy FROZEN fragment and must still count as covered, or legacy shadows it.
+        # Every record is years stale and there is no tarball at all — age must not matter,
+        # because a healthy frozen fragment is exactly as stale as a dead residue one.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-25.10", live=5, modified="2019-01-01T00:00:00Z")
+        assert not os.path.exists(os.path.join(fresh_workspace.input_path, "osv-all.tar.xz"))
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == {"25.10"}
+        assert p._osv_covers_legacy_namespace("ubuntu:25.10") is True
+
+    def test_both_filename_forms_resolve_to_bare_versions(self, fresh_workspace, auto_fake_fixdate_finder, monkeypatch):
+        # `ubuntu-<v>-lts.db` and `ubuntu-<v>.db` are both base ecosystems
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2)
+        _seed_fragment(fresh_workspace, "ubuntu-25.04", live=2)
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == {"18.04", "25.04"}
+        assert p._osv_covers_legacy_namespace("ubuntu:18.04") is True
+        assert p._osv_covers_legacy_namespace("ubuntu:25.04") is True
+
+    def test_pro_fragment_does_not_cover_the_base_release(self, fresh_workspace, auto_fake_fixdate_finder, monkeypatch):
+        # Pro/FIPS/Realtime ecosystems outlive the base release. They emit their own
+        # fragments; the base release must still fall through to legacy.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-pro-18.04-lts", live=20)
+        _seed_fragment(fresh_workspace, "ubuntu-pro-fips-updates-18.04-lts", live=20)
+        _seed_fragment(fresh_workspace, "ubuntu-pro-realtime-18.04-lts", live=20)
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == set()
+        assert p._osv_covers_legacy_namespace("ubuntu:18.04") is False
+
+    def test_malformed_fragment_is_uncovered_and_does_not_raise(self, fresh_workspace, auto_fake_fixdate_finder, monkeypatch):
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        fragments_dir = os.path.join(fresh_workspace.input_path, "fragments")
+        os.makedirs(fragments_dir)
+        with open(os.path.join(fragments_dir, "ubuntu-18.04-lts.db"), "wb") as f:
+            f.write(b"\x00\x01 not sqlite")
+        # a healthy neighbor still resolves — one bad file doesn't poison the scan
+        _seed_fragment(fresh_workspace, "ubuntu-22.04-lts", live=2)
+
+        p = Parser(workspace=fresh_workspace)
+        assert p._osv_covered_versions() == {"22.04"}
+
+    def test_covered_set_is_computed_once(self, fresh_workspace, auto_fake_fixdate_finder, monkeypatch):
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2)
+        p = Parser(workspace=fresh_workspace)
+
+        counted = []
+        real_count = p._fragment_live_record_count
+
+        def spy(path):
+            counted.append(path)
+            return real_count(path)
+
+        monkeypatch.setattr(p, "_fragment_live_record_count", spy)
+
+        first = p._osv_covered_versions()
+        assert first == {"18.04"}
+        assert counted, "expected the first call to actually open fragments"
+        after_first = len(counted)
+
+        # repeat calls, including through the namespace predicate, are served from cache
+        assert p._osv_covered_versions() == first
+        assert p._osv_covers_legacy_namespace("ubuntu:18.04") is True
+        assert len(counted) == after_first
+
+    def test_write_fragments_resets_the_cache(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # A fragment written mid-run must be reflected afterwards, otherwise the legacy
+        # passthrough (which runs later in get()) would use a pre-write coverage set.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 1)
+        _seed_archive(fresh_workspace, fixture_dir)
+        p = Parser(workspace=fresh_workspace)
+
+        assert p._osv_covered_versions() == set()  # nothing on disk yet
+
+        p._write_fragments()
+
+        covered = p._osv_covered_versions()
+        assert "22.04" in covered
+        assert "24.04" in covered
+
+
+class TestLegacyPassthroughUsesLiveCounts:
+    """End-to-end lever: CVE-2022-31258 is `not-affected` on bionic in normalized-cve-data.
+
+    Whether it gets emitted is decided entirely by what `ubuntu-18.04-lts.db` holds.
+
+    SCOPE NOTE: both tests exercise `_iter_normalized_cve_data()` with the coverage
+    filter at its default (on) — the setting the non-downconvert lane still uses. In
+    the downconvert lane the filter is off and legacy is merged into OSV per source
+    package, so a healthy fragment suppresses nothing there; see
+    TestMergedLaneCoverageGating.
+    """
+
+    def test_degenerate_fragment_lets_bionic_legacy_through(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # plucky shape planted at 18.04 (real threshold, no monkeypatching): the fragment
+        # exists but is a withdrawn residue, so legacy must NOT be suppressed
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=3, withdrawn=181)
+
+        p = Parser(workspace=fresh_workspace)
+        identifiers = sorted(r[0] for r in p._iter_normalized_cve_data())
+
+        assert "ubuntu:18.04/cve-2022-31258" in identifiers
+
+    def test_healthy_fragment_still_suppresses_bionic_legacy(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # the other half of the pair: real coverage still wins
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2, withdrawn=181)
+
+        p = Parser(workspace=fresh_workspace)
+        identifiers = sorted(r[0] for r in p._iter_normalized_cve_data())
+
+        assert "ubuntu:18.04/cve-2022-31258" not in identifiers
+        # ...and the genuinely-EOL namespaces are untouched by the filter
+        assert "ubuntu:12.04/cve-2012-5124" in identifiers
+
+
+# ---------------------------------------------------------------------------
+# Per-package merge of legacy into OSV (the downconvert lane)
+#
+# With `downconvert_osv_to_os` on, both sources emit the SAME identifier shape
+# — `{namespace}/{cve}` with a `{"Vulnerability": {...FixedIn: [...]}}` payload
+# — into one results DB whose writer is INSERT OR REPLACE. Yielding legacy then
+# OSV therefore let the OSV record overwrite legacy's WHOLESALE, destroying
+# FixedIn entries for source packages OSV doesn't carry. Measured on noble:
+# 4,189 (cve, package) pairs have a legacy fix version with no OSV entry, and
+# 2,381 of those rows were being silently destroyed because OSV had a record
+# for the same CVE covering other packages.
+#
+# The replacement is a per-package merge: OSV wins for every package it covers,
+# legacy's extra packages are appended, and each identifier is emitted once.
+# ---------------------------------------------------------------------------
+
+
+def _osv_affected(ecosystem, package, fixed=None):
+    """One OSV affected[] entry: `introduced: 0`, plus a `fixed` event when given."""
+    events = [{"introduced": "0"}]
+    if fixed is not None:
+        events.append({"fixed": fixed})
+    return {
+        "package": {"ecosystem": ecosystem, "name": package},
+        "ranges": [{"type": "ECOSYSTEM", "events": events}],
+    }
+
+
+def _osv_record(ubuntu_cve, ecosystem, packages, upstream=None, withdrawn=None):
+    """Build one hand-rolled OSV record for a single ecosystem.
+
+    `packages` maps source-package name → fixed version (None for "no fix yet").
+    `upstream` defaults to the CVE the UBUNTU-CVE- id names; pass [] to model a
+    record with no upstream alias (which `osv_to_os` rejects — but must NOT
+    veto legacy, since it isn't a retraction).
+    """
+    if upstream is None:
+        upstream = [ubuntu_cve.replace("UBUNTU-", "")]
+    payload = {
+        "id": ubuntu_cve,
+        "modified": "2026-08-01T00:00:00Z",
+        "upstream": upstream,
+        "details": "hand-built fixture record",
+        "affected": [_osv_affected(ecosystem, name, fixed) for name, fixed in packages.items()],
+    }
+    if withdrawn is not None:
+        payload["withdrawn"] = withdrawn
+    return payload
+
+
+def _seed_osv_fragment(workspace, slug, payloads):
+    """Write input/fragments/<slug>.db holding hand-built OSV records.
+
+    `_seed_fragment` plants live/withdrawn record-count ballast (empty affected[],
+    no upstream) for the coverage tests. This one plants records the downconverter
+    actually accepts, so the merged lane has real OSV-side material to merge
+    legacy into.
+    """
+    fragments_dir = os.path.join(workspace.input_path, "fragments")
+    os.makedirs(fragments_dir, exist_ok=True)
+    path = os.path.join(fragments_dir, f"{slug}.db")
+    with result.Writer(
+        workspace=workspace,
+        result_state_policy=result.ResultStatePolicy.DELETE_BEFORE_WRITE,
+        store_strategy=result.StoreStrategy.SQLITE,
+        write_location=path,
+    ) as w:
+        for payload in payloads:
+            w.write(
+                identifier=f"{slug}/{payload['id'].lower()}",
+                schema=schema.OSVSchema(version="1.7.0"),
+                payload=payload,
+            )
+    return path
+
+
+def _os_fixed_in_entry(name, namespace, version):
+    """A v3 FixedIn entry, the shape both sources produce.
+
+    (Named `_entry` so it doesn't read as the parser's own `_os_fixed_in`, which
+    pulls the list off a payload rather than building one row of it.)
+    """
+    return {
+        "Name": name,
+        "NamespaceName": namespace,
+        "VersionFormat": "dpkg",
+        "Version": version,
+        "VendorAdvisory": {"NoAdvisory": False},
+        "Available": None,
+    }
+
+
+def _os_payload(cve, namespace, fixed_in):
+    """A v3 `{"Vulnerability": {...}}` payload, as `osv_to_os` / map_parsed produce."""
+    return {
+        "Vulnerability": {
+            "Name": cve,
+            "NamespaceName": namespace,
+            "Description": "",
+            "Severity": "Medium",
+            "Metadata": {},
+            "Link": f"https://ubuntu.com/security/{cve}",
+            "FixedIn": list(fixed_in),
+        },
+    }
+
+
+def _legacy_envelope(cve, namespace, fixed_in):
+    """The legacy side of the merge, in the shape the temp legacy DB hands back.
+
+    `result.SQLiteReader` deserializes a row into the envelope dict
+    (`identifier` / `schema` / `item`), so the merge's second argument is an
+    envelope wrapping the `{"Vulnerability": {...}}` payload — not the payload
+    itself.
+    """
+    return {
+        "identifier": f"{namespace}/{cve.lower()}",
+        "schema": schema.OSSchema().url,
+        "item": _os_payload(cve, namespace, fixed_in),
+    }
+
+
+def _fixed_in_names(payload):
+    return [fi["Name"] for fi in payload["Vulnerability"]["FixedIn"]]
+
+
+def _fixed_in_by_name(payload):
+    return {fi["Name"]: fi for fi in payload["Vulnerability"]["FixedIn"]}
+
+
+class TestMergeLegacyFixedIn:
+    """`_merge_legacy_fixed_in` in isolation: per-package union, OSV always wins."""
+
+    def test_legacy_only_package_is_appended_with_osv_namespace(self):
+        # The whole point of the change: a source package legacy knows about and OSV
+        # doesn't must survive, carrying the OSV record's namespace (the identifier's
+        # namespace is authoritative for the merged record).
+        os_payload = _os_payload("CVE-2020-1", "ubuntu:20.04", [_os_fixed_in_entry("openssl", "ubuntu:20.04", "1.2-3")])
+        legacy = _legacy_envelope("CVE-2020-1", "ubuntu:20.04+esm", [_os_fixed_in_entry("check-mk", "ubuntu:20.04+esm", "0")])
+
+        Parser._merge_legacy_fixed_in(os_payload, legacy)
+
+        assert _fixed_in_names(os_payload) == ["openssl", "check-mk"]
+        assert _fixed_in_by_name(os_payload)["check-mk"]["NamespaceName"] == "ubuntu:20.04"
+        # appended as a copy — mutating the merged entry must not reach back into legacy
+        assert os_payload["Vulnerability"]["FixedIn"][1] is not legacy["item"]["Vulnerability"]["FixedIn"][0]
+        assert legacy["item"]["Vulnerability"]["FixedIn"][0]["NamespaceName"] == "ubuntu:20.04+esm"
+
+    def test_osv_entry_wins_for_a_package_both_cover(self):
+        # OSV is the fresher source. Its entry is kept verbatim and no duplicate
+        # FixedIn for the same source package is appended.
+        os_payload = _os_payload("CVE-2020-1", "ubuntu:20.04", [_os_fixed_in_entry("openssl", "ubuntu:20.04", "1.2-3")])
+        legacy = _legacy_envelope("CVE-2020-1", "ubuntu:20.04", [_os_fixed_in_entry("openssl", "ubuntu:20.04", "1.1-1")])
+
+        Parser._merge_legacy_fixed_in(os_payload, legacy)
+
+        assert _fixed_in_names(os_payload) == ["openssl"]
+        assert os_payload["Vulnerability"]["FixedIn"][0]["Version"] == "1.2-3"
+
+    def test_mixed_overlap_lands_only_the_new_packages(self):
+        os_payload = _os_payload(
+            "CVE-2020-1",
+            "ubuntu:20.04",
+            [
+                _os_fixed_in_entry("glibc", "ubuntu:20.04", "2.31-1"),
+                _os_fixed_in_entry("openssl", "ubuntu:20.04", "1.2-3"),
+            ],
+        )
+        legacy = _legacy_envelope(
+            "CVE-2020-1",
+            "ubuntu:20.04",
+            [
+                _os_fixed_in_entry("openssl", "ubuntu:20.04", "1.1-1"),  # overlaps → dropped
+                _os_fixed_in_entry("zabbix", "ubuntu:20.04", "3.0-1"),  # new → appended
+                _os_fixed_in_entry("glibc", "ubuntu:20.04", "2.30-1"),  # overlaps → dropped
+                _os_fixed_in_entry("sssd", "ubuntu:20.04", "1.16-1"),  # new → appended
+            ],
+        )
+
+        Parser._merge_legacy_fixed_in(os_payload, legacy)
+
+        assert _fixed_in_names(os_payload) == ["glibc", "openssl", "zabbix", "sssd"]
+        by_name = _fixed_in_by_name(os_payload)
+        assert by_name["openssl"]["Version"] == "1.2-3"
+        assert by_name["glibc"]["Version"] == "2.31-1"
+        assert by_name["zabbix"]["Version"] == "3.0-1"
+        assert by_name["sssd"]["Version"] == "1.16-1"
+
+    def test_osv_fields_other_than_fixed_in_are_untouched(self):
+        # Only FixedIn is merged. Severity/Link/Name/Description all stay OSV's —
+        # legacy's differ and must not bleed in.
+        os_payload = _os_payload("CVE-2020-1", "ubuntu:20.04", [_os_fixed_in_entry("openssl", "ubuntu:20.04", "1.2-3")])
+        os_payload["Vulnerability"]["Severity"] = "Critical"
+        os_payload["Vulnerability"]["Description"] = "from osv"
+        legacy = _legacy_envelope("CVE-2020-1", "ubuntu:20.04", [_os_fixed_in_entry("check-mk", "ubuntu:20.04", "0")])
+        legacy["item"]["Vulnerability"]["Severity"] = "Negligible"
+        legacy["item"]["Vulnerability"]["Description"] = "from legacy"
+        legacy["item"]["Vulnerability"]["Link"] = "https://example.com/legacy"
+
+        Parser._merge_legacy_fixed_in(os_payload, legacy)
+
+        vuln = os_payload["Vulnerability"]
+        assert vuln["Severity"] == "Critical"
+        assert vuln["Description"] == "from osv"
+        assert vuln["Link"] == "https://ubuntu.com/security/CVE-2020-1"
+        assert vuln["Name"] == "CVE-2020-1"
+        assert vuln["NamespaceName"] == "ubuntu:20.04"
+
+    @pytest.mark.parametrize(
+        ("osv_fixed_in", "legacy_fixed_in"),
+        [
+            ([], []),
+            ([], [_os_fixed_in_entry("check-mk", "ubuntu:20.04", "0")]),
+            ([_os_fixed_in_entry("openssl", "ubuntu:20.04", "1.2-3")], []),
+            (None, [_os_fixed_in_entry("check-mk", "ubuntu:20.04", "0")]),
+            ([_os_fixed_in_entry("openssl", "ubuntu:20.04", "1.2-3")], None),
+            ("not-a-list", [_os_fixed_in_entry("check-mk", "ubuntu:20.04", "0")]),
+            ([_os_fixed_in_entry("openssl", "ubuntu:20.04", "1.2-3")], "not-a-list"),
+        ],
+    )
+    def test_degenerate_fixed_in_does_not_raise(self, osv_fixed_in, legacy_fixed_in):
+        # The merge runs over every record in the feed; a missing, empty, or
+        # non-list FixedIn on either side must degrade rather than abort the run.
+        os_payload = _os_payload("CVE-2020-1", "ubuntu:20.04", [])
+        legacy = _legacy_envelope("CVE-2020-1", "ubuntu:20.04", [])
+        for target, value in ((os_payload, osv_fixed_in), (legacy["item"], legacy_fixed_in)):
+            if value is None:
+                del target["Vulnerability"]["FixedIn"]
+            else:
+                target["Vulnerability"]["FixedIn"] = value
+
+        Parser._merge_legacy_fixed_in(os_payload, legacy)  # must not raise
+
+    def test_merge_is_in_place_and_order_stable(self):
+        # The generator yields the payload it passed in, so the merge has to mutate
+        # rather than return a new dict. OSV entries keep their relative order and
+        # stay ahead of the appended legacy ones.
+        os_payload = _os_payload(
+            "CVE-2020-1",
+            "ubuntu:20.04",
+            [
+                _os_fixed_in_entry("zzz-osv", "ubuntu:20.04", "1"),
+                _os_fixed_in_entry("aaa-osv", "ubuntu:20.04", "2"),
+            ],
+        )
+        fixed_in_list = os_payload["Vulnerability"]["FixedIn"]
+        legacy = _legacy_envelope(
+            "CVE-2020-1",
+            "ubuntu:20.04",
+            [
+                _os_fixed_in_entry("zzz-legacy", "ubuntu:20.04", "3"),
+                _os_fixed_in_entry("aaa-legacy", "ubuntu:20.04", "4"),
+            ],
+        )
+
+        assert Parser._merge_legacy_fixed_in(os_payload, legacy) is None
+        assert os_payload["Vulnerability"]["FixedIn"] is fixed_in_list
+        assert _fixed_in_names(os_payload) == ["zzz-osv", "aaa-osv", "zzz-legacy", "aaa-legacy"]
+
+
+def _seed_collision_fragments(fresh_workspace):
+    """Seed OSV fragments that deliberately collide with the legacy fixtures.
+
+    Legacy identifiers from `normalized-cve-data`:
+      ubuntu:12.04/cve-2012-5124   chromium-browser 3.0.1271.97-0ubuntu0.12.04.1
+      ubuntu:12.04/cve-2013-6627   chromium-browser 31.0.1650.63-0ubuntu0.12.04.1~20131204.1
+      ubuntu:12.10/cve-2012-5124   chromium-browser 3.0.1271.97-0ubuntu0.12.10.1
+      ubuntu:12.10/cve-2013-6627   chromium-browser 31.0.1650.63-0ubuntu0.12.10.1~20131204.1
+      ubuntu:13.04/cve-2013-6627   chromium-browser 31.0.1650.63-0ubuntu0.13.04.1~20131204.1
+      ubuntu:18.04/cve-2022-31258  check-mk 0
+
+    The fragments planted here produce:
+      ubuntu:12.04/cve-2012-5124   openssl 1.2-3          → disjoint package, merge
+      ubuntu:12.10/cve-2013-6627   chromium-browser 99.0-1 → same package, OSV wins
+      ubuntu:12.04/cve-2098-1      openssl 9.9-9          → OSV only
+    """
+    _seed_osv_fragment(
+        fresh_workspace,
+        "ubuntu-12.04-lts",
+        [
+            _osv_record("UBUNTU-CVE-2012-5124", "Ubuntu:12.04:LTS", {"openssl": "1.2-3"}),
+            _osv_record("UBUNTU-CVE-2098-1", "Ubuntu:12.04:LTS", {"openssl": "9.9-9"}),
+        ],
+    )
+    _seed_osv_fragment(
+        fresh_workspace,
+        "ubuntu-12.10",
+        [_osv_record("UBUNTU-CVE-2013-6627", "Ubuntu:12.10", {"chromium-browser": "99.0-1"})],
+    )
+
+
+class TestMergedOSRecordStream:
+    """`_iter_merged_os_records`: one record per identifier, per-package union."""
+
+    def test_identifier_in_both_sources_is_emitted_once_with_the_union(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # ubuntu:12.04/cve-2012-5124 exists in both: OSV carries openssl, legacy
+        # carries chromium-browser. Before the merge, OSV's record replaced legacy's
+        # wholesale and chromium-browser's fix version was destroyed.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        records = list(p._iter_merged_os_records())
+
+        matching = [r for r in records if r[0] == "ubuntu:12.04/cve-2012-5124"]
+        assert len(matching) == 1, [r[0] for r in records]
+        _identifier, sch, payload = matching[0]
+        assert "/os/" in sch.url
+        by_name = _fixed_in_by_name(payload)
+        assert sorted(by_name) == ["chromium-browser", "openssl"]
+        assert by_name["openssl"]["Version"] == "1.2-3"
+        assert by_name["chromium-browser"]["Version"] == "3.0.1271.97-0ubuntu0.12.04.1"
+        assert by_name["chromium-browser"]["NamespaceName"] == "ubuntu:12.04"
+
+    def test_osv_wins_for_a_package_both_sources_carry(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # Same source package on both sides: exactly one FixedIn, holding OSV's version.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        by_id = {i: payload for i, _, payload in p._iter_merged_os_records()}
+
+        merged = by_id["ubuntu:12.10/cve-2013-6627"]
+        assert _fixed_in_names(merged) == ["chromium-browser"]
+        assert merged["Vulnerability"]["FixedIn"][0]["Version"] == "99.0-1"
+
+    def test_legacy_only_identifier_is_emitted(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # The regression this change exists to fix. ubuntu:12.10/cve-2012-5124 and
+        # ubuntu:13.04/cve-2013-6627 have no OSV counterpart at all; ubuntu:12.04/
+        # cve-2013-6627 has none either even though 12.04 has OSV data for other CVEs.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        by_id = {i: payload for i, _, payload in p._iter_merged_os_records()}
+
+        expected = {
+            "ubuntu:12.04/cve-2013-6627": "chromium-browser",
+            "ubuntu:12.10/cve-2012-5124": "chromium-browser",
+            "ubuntu:13.04/cve-2013-6627": "chromium-browser",
+            "ubuntu:18.04/cve-2022-31258": "check-mk",
+        }
+        for identifier, package in expected.items():
+            assert identifier in by_id, sorted(by_id)
+            assert _fixed_in_names(by_id[identifier]) == [package]
+
+    def test_osv_only_identifier_is_emitted_unchanged(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        by_id = {i: payload for i, _, payload in p._iter_merged_os_records()}
+
+        osv_only = by_id["ubuntu:12.04/cve-2098-1"]
+        assert _fixed_in_names(osv_only) == ["openssl"]
+        assert osv_only["Vulnerability"]["FixedIn"][0]["Version"] == "9.9-9"
+
+    def test_no_identifier_is_emitted_twice(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # THE core invariant. The results writer is INSERT OR REPLACE, so a duplicate
+        # identifier anywhere in the stream means one of the two records is silently
+        # destroyed — which is exactly the bug the merge replaces.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        identifiers = [i for i, _, _ in p._iter_merged_os_records()]
+
+        duplicates = sorted({i for i in identifiers if identifiers.count(i) > 1})
+        assert duplicates == [], duplicates
+        # and the full set is the union of the two sources, nothing dropped
+        assert sorted(identifiers) == [
+            "ubuntu:12.04/cve-2012-5124",
+            "ubuntu:12.04/cve-2013-6627",
+            "ubuntu:12.04/cve-2098-1",
+            "ubuntu:12.10/cve-2012-5124",
+            "ubuntu:12.10/cve-2013-6627",
+            "ubuntu:13.04/cve-2013-6627",
+            "ubuntu:18.04/cve-2022-31258",
+        ]
+
+    def test_no_identifier_is_emitted_twice_through_get(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # Same invariant, but over everything `get()` yields in the downconvert lane
+        # (real OSV fixture tarball + VEX + Pro-only-fix inference + legacy).
+        _seed_archive(fresh_workspace, fixture_dir)
+        _seed_vex_archive(fresh_workspace, fixture_dir)
+        _seed_normalized(fresh_workspace, fixture_dir)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        with patch.object(p, "_download_archive"), patch.object(p, "_download_vex_archive"):
+            identifiers = [i for i, _, _ in p.get()]
+
+        duplicates = sorted({i for i in identifiers if identifiers.count(i) > 1})
+        assert duplicates == [], duplicates
+
+    def test_withdrawn_osv_record_vetoes_legacy(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # A withdrawn OSV record is a RETRACTION and is authoritative: legacy must not
+        # resurrect the identifier it retracts. Only that one identifier is vetoed —
+        # the same CVE on other releases still emits from legacy.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_osv_fragment(
+            fresh_workspace,
+            "ubuntu-13.04",
+            [
+                _osv_record(
+                    "UBUNTU-CVE-2013-6627",
+                    "Ubuntu:13.04",
+                    {"chromium-browser": "31.0.1650.63-0ubuntu0.13.04.1~20131204.1"},
+                    withdrawn="2026-08-01T00:00:00Z",
+                ),
+            ],
+        )
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        identifiers = sorted(i for i, _, _ in p._iter_merged_os_records())
+
+        assert "ubuntu:13.04/cve-2013-6627" not in identifiers
+        assert "ubuntu:12.04/cve-2013-6627" in identifiers
+        assert "ubuntu:12.10/cve-2013-6627" in identifiers
+
+        # Control: the same fragment WITHOUT the retraction emits the identifier. Without
+        # this, the assertion above would also pass if the fragment's mere presence (or a
+        # typo in the fixture) were what removed the record.
+        _seed_osv_fragment(
+            fresh_workspace,
+            "ubuntu-13.04",
+            [_osv_record("UBUNTU-CVE-2013-6627", "Ubuntu:13.04", {"chromium-browser": "31.0.1650.63-0ubuntu0.13.04.1~20131204.1"})],
+        )
+        control = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        assert "ubuntu:13.04/cve-2013-6627" in {i for i, _, _ in control._iter_merged_os_records()}
+
+    def test_missing_upstream_rejection_does_not_veto_legacy(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # `osv_to_os` also returns None for a record with no upstream CVE. That is a
+        # shape we can't map, not a retraction — legacy still owns the identifier.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_osv_fragment(
+            fresh_workspace,
+            "ubuntu-13.04",
+            [_osv_record("UBUNTU-CVE-2013-6627", "Ubuntu:13.04", {"chromium-browser": "31.0-1"}, upstream=[])],
+        )
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        by_id = {i: payload for i, _, payload in p._iter_merged_os_records()}
+
+        assert "ubuntu:13.04/cve-2013-6627" in by_id, sorted(by_id)
+        # it came from legacy, verbatim — the unmappable OSV record contributed nothing
+        assert _fixed_in_names(by_id["ubuntu:13.04/cve-2013-6627"]) == ["chromium-browser"]
+        assert by_id["ubuntu:13.04/cve-2013-6627"]["Vulnerability"]["FixedIn"][0]["Version"] == "31.0.1650.63-0ubuntu0.13.04.1~20131204.1"
+
+    def test_unmappable_ecosystem_rejection_does_not_veto_legacy(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # The other non-withdrawn rejection: an ecosystem that maps to no base
+        # namespace (FIPS rebuilds against different crypto modules). Not a veto.
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_osv_fragment(
+            fresh_workspace,
+            "ubuntu-pro-fips-13.04-lts",
+            [_osv_record("UBUNTU-CVE-2013-6627", "Ubuntu:Pro:FIPS:13.04:LTS", {"chromium-browser": "31.0-1"})],
+        )
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        identifiers = sorted(i for i, _, _ in p._iter_merged_os_records())
+
+        assert "ubuntu:13.04/cve-2013-6627" in identifiers
+        # and the FIPS slice itself is still dropped, not smuggled in under some namespace
+        assert not any("fips" in i.lower() for i in identifiers), identifiers
+
+
+class TestMergedLaneTempStorage:
+    """The merged lane stages legacy in a throwaway SQLite DB; it must not leak."""
+
+    @pytest.fixture
+    def mkdtemp_spy(self, monkeypatch):
+        """Record every temp dir the parser creates so the test can assert on cleanup."""
+        created = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*args, **kwargs):
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+        monkeypatch.setattr(ubuntu_parser.tempfile, "mkdtemp", spy)
+        return created
+
+    def test_temp_dir_is_created_outside_input_and_removed_after_full_consumption(
+        self,
+        fresh_workspace,
+        fixture_dir,
+        auto_fake_fixdate_finder,
+        mkdtemp_spy,
+    ):
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        assert list(p._iter_merged_os_records())
+
+        assert len(mkdtemp_spy) == 1, mkdtemp_spy
+        # input/ is load-bearing (frozen fragments + at-cutover legacy); the scratch DB
+        # must not be staged inside it, where a stray .db would be read as a fragment.
+        assert not mkdtemp_spy[0].startswith(fresh_workspace.input_path)
+        assert not os.path.exists(mkdtemp_spy[0])
+
+    def test_temp_dir_removed_when_the_consumer_abandons_the_generator(
+        self,
+        fresh_workspace,
+        fixture_dir,
+        auto_fake_fixdate_finder,
+        mkdtemp_spy,
+    ):
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        gen = p._iter_merged_os_records()
+        next(gen)
+        gen.close()
+
+        assert mkdtemp_spy, "expected the merge to stage legacy in a temp dir"
+        assert not os.path.exists(mkdtemp_spy[0])
+
+    def test_temp_dir_removed_when_an_exception_propagates(
+        self,
+        fresh_workspace,
+        fixture_dir,
+        auto_fake_fixdate_finder,
+        mkdtemp_spy,
+    ):
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+
+        def exploding_fragments():
+            raise RuntimeError("fragment read blew up")
+            yield  # pragma: no cover - makes this a generator function
+
+        p._iter_fragments = exploding_fragments
+
+        with pytest.raises(RuntimeError, match="fragment read blew up"):
+            list(p._iter_merged_os_records())
+
+        assert mkdtemp_spy, "expected the merge to stage legacy before reading fragments"
+        assert not os.path.exists(mkdtemp_spy[0])
+
+    def test_nothing_is_written_under_input_path(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
+        # The staging DB landing under input/ would be read back as a fragment on the
+        # next run (and survive, since input/ is deliberately never cleared).
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_collision_fragments(fresh_workspace)
+
+        def input_tree():
+            return sorted(
+                os.path.relpath(os.path.join(root, name), fresh_workspace.input_path)
+                for root, _dirs, files in os.walk(fresh_workspace.input_path)
+                for name in files
+            )
+
+        before = input_tree()
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        assert list(p._iter_merged_os_records())
+
+        assert input_tree() == before
+
+
+class TestMergedLaneCoverageGating:
+    """The release-level coverage verdict is an alarm in the merged lane, not a gate."""
+
+    def test_downconvert_lane_emits_legacy_for_an_osv_covered_release(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # Direct inversion of TestParserLegacyPassthrough::
+        # test_skips_records_for_osv_covered_namespaces. A HEALTHY 18.04 fragment used
+        # to suppress the whole bionic legacy record; now legacy is merged per-package
+        # instead, so ubuntu:18.04/cve-2022-31258 IS emitted (the fragment holds no
+        # record for that CVE, so there is nothing to merge it into).
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_fragment(fresh_workspace, "ubuntu-18.04-lts", live=2)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        assert p._osv_covers_legacy_namespace("ubuntu:18.04") is True
+
+        identifiers = sorted(i for i, _, _ in p._iter_merged_os_records())
+        assert "ubuntu:18.04/cve-2022-31258" in identifiers
+
+    def test_non_downconvert_lane_still_applies_the_release_gate(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # Unchanged behavior for the OSV-shape lane: identifiers there don't collide
+        # (`ubuntu:18.04/...` vs `ubuntu-18.04-lts/...`), so there is nothing to merge
+        # and the old release-level filter still runs.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_archive(fresh_workspace, fixture_dir)
+        _seed_vex_archive(fresh_workspace, fixture_dir)
+        _seed_normalized(fresh_workspace, fixture_dir)
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=False)
+        with patch.object(p, "_download_archive"), patch.object(p, "_download_vex_archive"):
+            identifiers = [i for i, _, _ in p.get()]
+
+        assert "ubuntu:18.04/cve-2022-31258" not in identifiers
+        assert "ubuntu:12.04/cve-2012-5124" in identifiers
+        # nothing was merged: OSV records keep their OSV identifier shape and schema
+        assert any(i.startswith("ubuntu-18.04-lts/") for i in identifiers)
+
+    def test_coverage_verdict_still_logs_in_the_downconvert_lane(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch, caplog):
+        # The measurement is now an alarm rather than a gate — but it has to keep
+        # firing every run, in both lanes, or a plucky-style coverage collapse goes
+        # unnoticed. Threshold at 2 so the fixture fragments land on both verdicts:
+        # the tarball gives 18.04 two live records, and the planted 25.04 is the
+        # withdrawn-residue shape.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 2)
+        _seed_archive(fresh_workspace, fixture_dir)
+        _seed_vex_archive(fresh_workspace, fixture_dir)
+        _seed_normalized(fresh_workspace, fixture_dir)
+        _seed_fragment(fresh_workspace, "ubuntu-25.04", live=1, withdrawn=181)  # degenerate
+
+        p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=True)
+        with caplog.at_level(logging.INFO), patch.object(p, "_download_archive"), patch.object(p, "_download_vex_archive"):
+            identifiers = [i for i, _, _ in p.get()]
+
+        assert "osv coverage: ubuntu 18.04 has 2 live records -> covered" in caplog.text
+        assert "osv coverage: ubuntu 25.04 has 1 live records -> uncovered" in caplog.text
+        assert "treating it as NOT covered by OSV" in caplog.text
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+        # ...and the covered verdict suppressed nothing
+        assert "ubuntu:18.04/cve-2022-31258" in identifiers
+
 
 class TestParserEmissionOrder:
-    """Policy: legacy first, OSV last. Identifier shapes don't collide so this is informational."""
+    """Emission policy, and the no-duplicate-identifier invariant it used to stand in for.
+
+    In the non-downconvert lane the two sources genuinely can't collide — legacy emits
+    `ubuntu:X.YY/cve-...` and OSV emits `ubuntu-X.YY-lts/ubuntu-cve-...` — so ordering
+    there is policy only. In the DOWNCONVERT lane both sides emit the same
+    `ubuntu:X.YY/cve-...` shape into an INSERT OR REPLACE writer, which made ordering
+    load-bearing and destructive: OSV overwrote legacy's whole record. The merge
+    replaced ordering with the real invariant, asserted below — every identifier is
+    emitted exactly once.
+    """
 
     def test_legacy_yielded_before_osv(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder):
         _seed_archive(fresh_workspace, fixture_dir)
@@ -799,6 +1792,23 @@ class TestParserEmissionOrder:
         legacy_indices = [i for i, x in enumerate(ids) if x.startswith("ubuntu:")]
         if legacy_indices:
             assert max(legacy_indices) < first_osv
+
+    def test_no_duplicate_identifiers_in_either_lane(self, fresh_workspace, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # The invariant that actually protects the data. Threshold at 1 so every fixture
+        # release reads as OSV-covered — the configuration under which the old code
+        # suppressed legacy wholesale, and the one where a merge bug would show up as a
+        # repeated identifier.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 1)
+        _seed_archive(fresh_workspace, fixture_dir)
+        _seed_vex_archive(fresh_workspace, fixture_dir)
+        _seed_normalized(fresh_workspace, fixture_dir)
+
+        for downconvert in (False, True):
+            p = Parser(workspace=fresh_workspace, downconvert_osv_to_os=downconvert)
+            with patch.object(p, "_download_archive"), patch.object(p, "_download_vex_archive"):
+                ids = [t[0] for t in p.get()]
+            duplicates = sorted({i for i in ids if ids.count(i) > 1})
+            assert duplicates == [], f"downconvert={downconvert}: {duplicates}"
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +1855,11 @@ class TestProviderUpdate:
         assert any("/osv/schema-1.7.0.json" in s for s in schemas), schemas
         assert any("/osv/schema-1.6.3.json" in s for s in schemas), schemas
 
-    def test_writes_mixed_schema_with_legacy(self, helpers, fixture_dir, auto_fake_fixdate_finder):
+    def test_writes_mixed_schema_with_legacy(self, helpers, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # The OSV fixtures are tiny (1-2 records per fragment) where production fragments
+        # hold thousands, so scale the coverage threshold down to exercise the covered
+        # path — otherwise every fixture release reads as uncovered and legacy backfills it.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 1)
         ws = helpers.provider_workspace_helper(name=Provider.name())
         c = Config()
         c.runtime.result_store = result.StoreStrategy.FLAT_FILE
@@ -866,6 +1880,12 @@ class TestProviderUpdate:
         # 17 real OSV + 2 inferred-from-Pro base envelopes + 5 legacy envelopes
         # (CVE-2022-31258 bionic filtered by OSV coverage on 18.04).
         # Legacy: 2012-5124×2 + 2013-6627×3 = 5
+        #
+        # Unchanged by the per-package merge: this test pins the NON-downconvert lane
+        # (`downconvert_osv_to_os = False` above), where the two sources emit different
+        # identifier shapes, nothing collides, and the release-level coverage filter
+        # still runs. The merged lane's count is pinned by
+        # test_merged_lane_writes_legacy_and_osv_without_collisions below.
         assert ws.num_result_entries() == 24
 
         # check mixed-schema output
@@ -878,8 +1898,16 @@ class TestProviderUpdate:
         assert any("/osv/schema-1.7.0.json" in s for s in schemas), schemas
         assert any("/os/schema-" in s for s in schemas), schemas
 
-    def test_via_snapshot(self, helpers, fixture_dir, fake_fixdate_finder):
+    def test_via_snapshot(self, helpers, fixture_dir, fake_fixdate_finder, monkeypatch):
         fake_fixdate_finder(responses=[Result(date=datetime.date(2024, 1, 1), kind="first-observed")])
+        # Fixture fragments hold 1-2 records where production holds thousands; scale the
+        # coverage threshold down so 18.04 counts as OSV-covered and the bionic legacy
+        # record stays filtered (the snapshot set covers the EOL namespaces only).
+        #
+        # The per-package merge does not move this snapshot set: it applies only when
+        # `downconvert_osv_to_os` is on, and this test pins the OSV-shape lane
+        # (`= False` below), where the release-level filter still runs unchanged.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 1)
 
         ws = helpers.provider_workspace_helper(name=Provider.name())
         c = Config()
@@ -901,6 +1929,51 @@ class TestProviderUpdate:
             p.update(None)
 
         ws.assert_result_snapshots()
+
+    def test_merged_lane_writes_legacy_and_osv_without_collisions(self, helpers, fixture_dir, auto_fake_fixdate_finder, monkeypatch):
+        # The downconvert lane end-to-end, through the real Config -> Provider -> Parser
+        # plumbing and the real results writer (which is INSERT OR REPLACE).
+        #
+        # Expected count from first principles:
+        #   OSV side, after downconversion (see TestParserIteration for the 19 envelopes
+        #   that reach it): 12. The 19 lose 4 plain-Pro CVE-2016-20013 slices (all
+        #   unfixed, so no `+esm` record), the withdrawn 14.04/tpp CVE-2013-2208, the
+        #   withdrawn Pro:14.04 and inferred-base 14.04 CVE-2020-36325 pair, and gain
+        #   `ubuntu:16.04+esm/cve-2021-3782` from the Pro:16.04 wayland fix.
+        #   Legacy side: all 6 envelopes, because the release-level filter is off here.
+        #   Overlap: none — no fixture CVE exists on both sides for the same release.
+        #   12 + 6 = 18.
+        #
+        # The threshold is scaled to 1 so every fixture release reads as OSV-covered:
+        # that is precisely the configuration in which the old code emitted 12 + 5 = 17
+        # and dropped the bionic legacy record. 18 is the regression guard.
+        monkeypatch.setattr(ubuntu_parser, "_MIN_LIVE_RECORDS_FOR_COVERAGE", 1)
+        ws = helpers.provider_workspace_helper(name=Provider.name())
+        c = Config()
+        c.runtime.result_store = result.StoreStrategy.FLAT_FILE
+        c.downconvert_osv_to_os = True
+
+        p = Provider(root=str(ws.root), config=c)
+        _stage_workspace_for_update(str(ws.root), fixture_dir)
+        input_path = os.path.join(str(ws.root), "ubuntu", "input")
+        shutil.copytree(
+            os.path.join(fixture_dir, "normalized-cve-data"),
+            os.path.join(input_path, "normalized-cve-data"),
+        )
+        _build_sample_archive(fixture_dir, "vex", "vex", os.path.join(input_path, "vex-all.tar.xz"))
+
+        with patch.object(p.parser, "_download_archive"), patch.object(p.parser, "_download_vex_archive"):
+            p.update(None)
+
+        assert ws.num_result_entries() == 18
+
+        identifiers = []
+        for f in ws.result_files():
+            with open(f, "rb") as fh:
+                identifiers.append(orjson.loads(fh.read())["identifier"])
+        # every record is OS shape and every identifier is distinct on disk
+        assert len(set(identifiers)) == len(identifiers) == 18
+        assert "ubuntu:18.04/cve-2022-31258" in identifiers, sorted(identifiers)
 
 
 # ---------------------------------------------------------------------------

@@ -42,11 +42,31 @@ OSV data after they reach EOL, the following strategy is used:
 
 1. The OSV data is downloaded.
 2. The OSV data is sharded by ecosystem, so that there is a cache per ubuntu
-   version
-3. On subsequent runs, the cache is replaced with the new OSV data _if new data
-   for that version is present in the data_, otherwise the cache stands
-indefinitely, so that vunnel will emit the last known state of each Ubuntu
-version as it goes EOL.
+   version.
+3. On subsequent runs, a version's fragment is rewritten from today's tarball
+   whenever that ecosystem string appears in it, and left untouched otherwise —
+   so a release that drops out of the feed keeps emitting its last known state.
+4. Which source is *served* for a release — its OSV fragment or the frozen
+   `normalized-cve-data` cache — is a separate decision, keyed on live-record
+   density rather than on fragment existence.
+
+The two caches have deliberately different lifecycles, and it is worth being
+precise about which one "the cache stands indefinitely" applies to:
+
+| Cache | Written by the provider? | Lifecycle |
+|---|---|---|
+| `input/normalized-cve-data/` | **Never** | Kept forever, shadowed whenever OSV has live data for the release |
+| `input/fragments/*.db` | Every run, per ecosystem | Rewritten wholesale (`DELETE_BEFORE_WRITE`) for each ecosystem present in today's tarball; frozen only for ecosystems absent from it |
+
+So the keep-forever-and-shadow model holds for `normalized-cve-data` but NOT
+for fragments: a fragment is replaced, not layered. That distinction is the
+whole reason step 4 exists. Because Canonical leaves a residue of
+already-`withdrawn` records behind instead of dropping an EOLed ecosystem, the
+condition in step 3 still fires for a release that has stopped being published,
+and the fragment gets rewritten from residue — see "Known remaining work"
+below. Step 4 is what keeps such a release serving usable data anyway, by
+declining to let a residue-only fragment shadow `normalized-cve-data`. See "How
+the provider decides a release is OSV-covered" below.
 
 ## Data sources
 
@@ -57,7 +77,7 @@ The provider reads four things, in priority order:
 | OSV CVE feed (`osv/cve/**`) | `https://security-metadata.canonical.com/osv/osv-all.tar.xz` | Authoritative ranges + fix versions for currently-tracked releases | Streamed each run, never extracted to disk |
 | OSV USN feed (`osv/usn/**`) | same tarball | Authoritative fix-ship dates (USN.published) — see "USN fix-date overlay" below | In-memory index built each run; not persisted |
 | OpenVEX feed | `https://security-metadata.canonical.com/vex/vex-all.tar.xz` | Fix disposition (won't-fix vs other) — see "Why VEX" below | Streamed each run; in-memory index, not persisted |
-| `input/normalized-cve-data/` | local | At-cutover EOL releases (precise → mantic) that have never appeared in either of the above | Frozen; populated by the v3 provider, kept untouched after v3's removal |
+| `input/normalized-cve-data/` | local | Releases the live feeds carry no usable data for: precise → mantic, plus oracular and plucky (see "How the provider decides a release is OSV-covered") | Frozen; populated by the v3 provider, kept untouched after v3's removal |
 | (fix-date cache) | `input/grype-db-observed-fix-dates.db` | Cross-provider fallback for fix dates when no USN advisory shipped the fix | Refreshed each run |
 
 USN records are **not emitted** as their own envelopes — the previous provider
@@ -97,13 +117,19 @@ OSV records describe a CVE across N releases in one document. We
 re-shard into one envelope per (release, CVE) for two reasons:
 
 1. **Survive EOL transitions without operator action.** When a release
-   drops out of the OSV feed (currently lunar/kinetic/etc.; eventually
-   questing/plucky/oracular), its fragment file simply stops being
+   genuinely drops out of the OSV feed, its fragment file stops being
    rewritten. The fragment persists, frozen at the last-known state, and
    subsequent runs continue to emit it. There is no hardcoded EOL list
    and no manual snapshot step — the on-disk set of fragments IS the
-   list of releases the provider knows about. When 25.10 EOLs in 2026
-   the same machinery handles it.
+   list of releases the provider knows about. When 25.10 EOLs the same
+   machinery handles it.
+
+   The caveat, and it is a large one: Canonical mostly *doesn't* drop a
+   release out of the feed. It keeps emitting a shrinking residue of
+   `withdrawn` records, which `DELETE_BEFORE_WRITE` happily writes over
+   the good fragment. So the freeze is not automatic, and "the fragment
+   exists" is not the same claim as "the release is still published."
+   See "How the provider decides a release is OSV-covered".
 
 2. **Match the downstream contract.** grype's dpkg matcher resolves
    per-namespace via `search.ByDistro`. Per-ecosystem fragments map 1:1
@@ -112,7 +138,7 @@ re-shard into one envelope per (release, CVE) for two reasons:
 
 ### Why fragments stay separate for Pro/FIPS/Realtime/etc.
 
-Today's tarball publishes 32 distinct ecosystems:
+Today's tarball publishes 33 distinct ecosystems:
 
 - Base: `Ubuntu:14.04:LTS` through `Ubuntu:26.04:LTS`, plus interim
   releases like `Ubuntu:25.10`
@@ -128,6 +154,125 @@ subscription-tier-aware matching eventually, and collapsing here would
 be a one-way decision. Cost: ~2.5 GB of additional fragment storage
 across 20 sub-ecosystems.
 
+## How the provider decides a release is OSV-covered
+
+There is exactly one question to answer per release: is this release
+being served by OSV, or does it need to come from an older source? The
+answer decides whether the legacy `normalized-cve-data` passthrough emits
+for that release at all — `Parser._osv_covers_legacy_namespace(ns)`.
+
+### Three service tiers
+
+| Tier | Served from | Members today |
+|---|---|---|
+| Actively published | live OSV feed | jammy, noble, focal, bionic, trusty/ESM, xenial/ESM, questing, plus Pro/FIPS/Realtime/BlueField |
+| Aged out after the OSV cutover (2026-06-24) | frozen fragment on disk | *none yet* — questing EOLed ~2026-07 but is still published, at 13,218 live records |
+| Already EOL before the cutover | `input/normalized-cve-data/` | precise → mantic, plus oracular (EOL ~2025-07) and plucky (EOL ~2026-01) |
+
+Plucky and oracular both predate the cutover, so they belong in the third
+tier. They were being assigned to the first, which is the bug this
+section exists to explain.
+
+### Why "does the fragment exist" was the wrong test
+
+The original predicate asked whether `ubuntu-<version>.db` (or
+`ubuntu-<version>-lts.db`) existed on disk. Because
+`DELETE_BEFORE_WRITE` creates a fragment for every ecosystem string the
+tarball mentions, that is equivalent to asking whether the ecosystem
+string appears *anywhere* in the tarball — at any density, in any state.
+
+Canonical does not stop emitting an EOLed release. It leaves behind a
+residue of already-`withdrawn` records, so the ecosystem string survives
+and the fragment gets rewritten from the residue. Records per ecosystem
+in today's tarball (2026-09-02):
+
+```
+27568 (  695 withdrawn)  Ubuntu:24.04:LTS
+13365 (  147 withdrawn)  Ubuntu:25.10
+  184 (  181 withdrawn)  Ubuntu:25.04     <- plucky
+  157 (  153 withdrawn)  Ubuntu:24.10     <- oracular
+   15 (   15 withdrawn)  Ubuntu:26.04     <- residue from the pre-LTS ecosystem relabel
+```
+
+The residue exists because a retracted record is never regenerated: it
+keeps its stale plucky `affected[]` entry forever.
+
+Consequence: the provider emitted **3** records for `ubuntu:25.04` and
+**zero** for `ubuntu:24.10`, while `normalized-cve-data/` held ~25,575
+CVEs with plucky patches (9,778 `released`, 78,463 `not-affected`
+entries, 6,325 `needed`, 728 `ignored`) — every one of them suppressed
+because the existence test concluded OSV had plucky covered. Canonical's
+own OVAL export still carries plucky's terminal state, at 9,157 CVE
+definitions, so the OSV export dropping it looks like an upstream defect
+worth reporting.
+
+### The density test
+
+`_osv_covers_legacy_namespace` now asks how many **live**
+(non-`withdrawn`) records the release's base fragment holds, and counts
+the release as covered only at `_MIN_LIVE_RECORDS_FOR_COVERAGE = 100` or
+more. `Parser._fragment_live_record_count()` does the counting;
+`Parser._osv_covered_versions()` caches the per-run answer and is reset
+at the start of `_write_fragments`. As before, only base-ecosystem
+filenames are considered, so a Pro fragment never establishes coverage
+for its base release.
+
+Discarding withdrawn records is uniform and correct because `withdrawn`
+is a **whole-record** OSV field, not a per-ecosystem one. All 181 of
+plucky's withdrawn records are withdrawn for every other release they
+list too — 148 of them also appear in `ubuntu-24.04-lts.db`, withdrawn
+there as well. Noble discards its own 695 the same way.
+
+The threshold sits ~25x clear of both sides of the gap:
+
+| Fragment | Live records |
+|---|---|
+| `Ubuntu:26.04` | 0 |
+| `Ubuntu:25.04` (plucky) | 3 |
+| `Ubuntu:24.10` (oracular) | 4 |
+| ecosystem-rename stubs: `Ubuntu:22.04:LTS:for:NVIDIA:BlueField`, the two `Ubuntu:Pro:*:Realtime:Kernel` variants | 1–2 |
+| `Ubuntu:Pro:26.04:LTS` — the smallest healthy fragment | 986 |
+| everything else | 8,000–35,000 |
+
+Counting via SQL `not like '%"withdrawn":%'` costs 14.3s across the real
+33-fragment, ~7 GB set and matches full JSON parsing exactly, so the cheap
+test is also the correct one.
+
+### Two subtleties, both easy to regress
+
+1. **Coverage is computed from the fragments on disk, not from today's
+   tarball.** A release that has genuinely aged out of the feed keeps a
+   healthy frozen fragment and must still count as covered, so legacy
+   does not shadow it. Counting from the tarball instead would wrongly
+   mark every frozen release uncovered — that is the middle service tier
+   above, and not shadowing it is the entire point of freezing
+   fragments.
+2. **Coverage keys on live-record count only, never on record age or
+   `modified` staleness.** A healthy frozen fragment is stale by
+   construction, so age cannot distinguish it from a degenerate residue
+   fragment. Published timestamps are especially untrustworthy here:
+   Canonical's OVAL directory listing shows plucky "Modified
+   2026-08-31", while the `<oval:timestamp>` inside that same file reads
+   2025-11-27 and the file contains no 2026 CVEs at all. Publication
+   mtimes are republish artifacts, not content freshness.
+
+### Misclassification here is additive, not destructive
+
+If a live release is wrongly marked uncovered, legacy emits alongside
+OSV and OSV still wins per-CVE, because OSV is yielded last (see
+"Operational invariants"). The failure mode is redundant rows, not lost
+data. That layering is what makes a count-with-clearance heuristic an
+acceptable way to answer the coverage question at all.
+
+### Known remaining work
+
+This change fixes the *shadowing*, not the fragment clobbering that
+caused it. `_write_fragments` still rewrites a fragment from whatever the
+tarball carries, residue included, so a fragment can still silently lose
+most of its rows. A follow-up will persist a per-ecosystem manifest, so
+that the decision to freeze a fragment is recorded rather than inferred
+from the fragment's contents on every run.
+
 ## Per-run flow
 
 ```
@@ -139,6 +284,7 @@ Provider.update()
       ├─ _load_vex_overlay()       # build in-memory wont-fix index from VEX
       ├─ _load_usn_overlay()       # build in-memory (eco, pkg, fix-ver) → USN.published index
       ├─ _write_fragments(overlay):
+      │     reset the _osv_covered_versions() cache
       │     for each osv/cve/**/*.json (streaming, no extraction):
       │         slice_by_ecosystem(record)        # group affected[] by ecosystem
       │         _annotate_wont_fix(...)           # stamp anchore.status from VEX
@@ -146,6 +292,8 @@ Provider.update()
       │             open fragment writer (lazy, DELETE_BEFORE_WRITE)
       │             insert envelope
       ├─ yield from _iter_normalized_cve_data()   # legacy first
+      │     skip releases where _osv_covers_legacy_namespace(ns);
+      │     coverage = base fragment holds >= 100 live records
       └─ yield from _iter_fragments()             # OSV second
             for each base ecosystem:
               yield real base envelopes (patch_fix_date applied;
@@ -313,14 +461,22 @@ tracked releases are present (jammy, noble, focal, bionic, trusty/ESM,
 xenial/ESM, questing, plus Pro/FIPS/etc.). Releases that were EOL
 before Canonical's OSV/VEX feeds launched — precise, quantal, raring,
 saucy, utopic, vivid, wily, yakkety, zesty, artful, cosmic, disco,
-eoan, groovy, hirsute, impish, kinetic, lunar, mantic, oracular — are
-absent.
+eoan, groovy, hirsute, impish, kinetic, lunar, mantic — are absent.
+Oracular and plucky are nominally present but effectively absent: what
+remains of them is `withdrawn` residue (see "How the provider decides a
+release is OSV-covered"), so for practical purposes they belong on that
+list too.
 
 The v3 provider's `normalized-cve-data/` cache covers those releases
 (it was populated from `ubuntu-cve-tracker` git history before v3 was
-retired). The new provider reads it via the vendored `map_parsed` from
-`parser_legacy.py` and emits OS-schema envelopes for releases not
-already covered by an OSV fragment.
+retired). Its scope runs further than the pre-cutover set: the cache
+is current to ubuntu-cve-tracker rev `c156268` and carries questing
+(1.87M patch entries) and resolute (1.75M) as well as plucky and
+oracular — so for the releases OSV still publishes, the cache is
+redundant rather than missing, and the coverage predicate is what keeps
+it from shadowing live data. The new provider reads it via the vendored
+`map_parsed` from `parser_legacy.py` and emits OS-schema envelopes for
+releases not already covered by an OSV fragment.
 
 `normalized-cve-data` records carry `status: "ignored"` directly, which
 `map_parsed` already converts to `FixedIn[].VendorAdvisory.NoAdvisory =
@@ -345,11 +501,17 @@ provider never writes to it.
   its own OSV or OS schema URL) are the dispatch signal downstream
   consumers gate on — a global version bump is both redundant and
   destructive.
-- **Identifier shapes do not collide.** OSV fragment envelopes use
-  `ubuntu-{slug}/ubuntu-cve-X` (hyphen-prefixed); legacy envelopes use
-  `ubuntu:{X.YY}/cve-X` (colon-prefixed). The emit order (legacy
-  first, OSV last) is policy-only — `INSERT OR REPLACE` collisions
-  don't happen in practice today.
+- **Emit order is load-bearing: legacy first, OSV last.** In OSV-shaped
+  output the two identifier spaces are disjoint — OSV fragment envelopes
+  use `ubuntu-{slug}/ubuntu-cve-X` (hyphen-prefixed), legacy envelopes
+  use `ubuntu:{X.YY}/cve-X` (colon-prefixed). With
+  `downconvert_osv_to_os` on, they **do** collide: both paths emit
+  `{namespace}/{cve.lower()}`. That collision is deliberate. Because OSV
+  is yielded last, `INSERT OR REPLACE` lets real OSV data override
+  legacy data for the same `(namespace, CVE)`. See
+  `TestParserEmissionOrder` and the comment near the `get()` method.
+  This layering is what makes coverage misclassification additive rather
+  than destructive.
 - **`compatible_schema()` is intentionally NOT implemented.** The
   parser yields `(identifier, Schema, payload)` triples directly; the
   classmethod is a per-provider filter bitnami uses to gate on schema
@@ -373,6 +535,14 @@ each fragment payload. The grype `ubuntuStrategy` skips withdrawn
 records entirely; the legacy passthrough is the only path a
 withdrawn-by-OSV CVE can still reach the DB (via a frozen `results.db`
 row for an EOL release).
+
+`withdrawn` is a **whole-record** field, not a per-ecosystem or
+per-`affected[]` one: a withdrawn record is withdrawn for every release
+it lists. That is what makes it safe to ignore withdrawn records when
+measuring whether a release is still being published. It is also the
+mechanism behind the residue problem — because a retracted record is
+never regenerated, it keeps listing releases Canonical stopped tracking
+years ago. See "How the provider decides a release is OSV-covered".
 
 ## What grype expects
 
@@ -404,7 +574,7 @@ it via config:
 ```yaml
 providers:
   ubuntu:
-    downconvert_osv_to_os: true   # default: false
+    downconvert_osv_to_os: true   # default: true
     downconvert_emit_esm: true    # default: true; only meaningful when downconvert_osv_to_os is on
 ```
 
